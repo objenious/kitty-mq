@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"cloud.google.com/go/pubsub"
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"github.com/go-kit/kit/endpoint"
 	"github.com/objenious/kitty"
@@ -28,9 +27,9 @@ func makeTestEP(resChan chan *testStruct) endpoint.Endpoint {
 }
 
 func makeTransport(ctx context.Context, errChan chan error) *Transport {
-	return NewTransport(ctx, project).Middleware(func(h Handler) Handler {
-		return func(ctx context.Context, msg MQTT.Message) error {
-			err := h(ctx, msg)
+	return NewTransport(ctx, url).Middleware(func(h Handler) Handler {
+		return func(clt MQTT.Client, msg MQTT.Message) error {
+			err := h(clt, msg)
 			if err != nil {
 				errChan <- err
 			}
@@ -43,11 +42,7 @@ func makeTransport(ctx context.Context, errChan chan error) *Transport {
 func TestSingleEndpoint(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	err := createTopicAndSub(ctx, "pub", "sub")
-	if err != nil {
-		t.Fatal(err)
-		return
-	}
+	createTopicAndSub(ctx, "pub", "", "")
 
 	resChan := make(chan *testStruct)
 	errChan := make(chan error)
@@ -57,10 +52,8 @@ func TestSingleEndpoint(t *testing.T) {
 	}()
 
 	{
-		send(ctx, "pub", tr, []byte(`{"foo":"bar"}`))
-		if err != nil {
-			t.Fatalf("send to pubsub : %s", err)
-		}
+		send(ctx, tr, "pub", 0, true, `{"foo":"bar"}`)
+
 		select {
 		case <-ctx.Done():
 			t.Fatal("timeout")
@@ -78,24 +71,18 @@ func TestSingleEndpoint(t *testing.T) {
 func TestSynchronous(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	err := createTopicAndSub(ctx, "syncpub", "syncsub")
-	if err != nil {
-		t.Fatal(err)
-		return
-	}
+	createTopicAndSub(ctx, "syncpub", "", "")
 
 	resChan := make(chan *testStruct)
 	errChan := make(chan error)
-	tr := makeTransport(ctx, errChan).Endpoint("syncsub", makeTestEP(resChan), Decoder(decode), Synchronous(true))
+	tr := makeTransport(ctx, errChan).Endpoint("syncsub", makeTestEP(resChan), Decoder(decode))
 	go func() {
 		kitty.NewServer(tr).Run(ctx)
 	}()
 
 	{
-		send(ctx, "syncpub", tr, []byte(`{"foo":"bar"}`))
-		if err != nil {
-			t.Fatalf("send to pubsub : %s", err)
-		}
+		send(ctx, tr, "syncpub", 0, false, `{"foo":"bar"}`)
+
 		select {
 		case <-ctx.Done():
 			t.Fatal("timeout")
@@ -113,16 +100,8 @@ func TestSynchronous(t *testing.T) {
 func TestMultipleEndpoints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	err := createTopicAndSub(ctx, "mpub", "msub")
-	if err != nil {
-		t.Fatal(err)
-		return
-	}
-	err = createTopicAndSub(ctx, "mpub2", "msub2")
-	if err != nil {
-		t.Fatal(err)
-		return
-	}
+	createTopicAndSub(ctx, "mpub", "", "")
+	createTopicAndSub(ctx, "mpub2", "", "")
 	errChan := make(chan error)
 	resChan := make(chan *testStruct)
 	res2Chan := make(chan *testStruct)
@@ -135,7 +114,7 @@ func TestMultipleEndpoints(t *testing.T) {
 	}()
 
 	{
-		err := send(ctx, "mpub", tr, []byte(`{"foo":"bar"}`))
+		err := send(ctx, tr, "mpub", 0, false, `{"foo":"bar"}`)
 		if err != nil {
 			t.Fatalf("send to pubsub : %s", err)
 		}
@@ -153,7 +132,7 @@ func TestMultipleEndpoints(t *testing.T) {
 		}
 	}
 	{
-		err := send(ctx, "mpub2", tr, []byte(`{"foo":"bar2"}`))
+		err := send(ctx, tr, "mpub2", 0, false, `{"foo":"bar2"}`)
 		if err != nil {
 			t.Fatalf("send to pubsub : %s", err)
 		}
@@ -176,11 +155,7 @@ func TestMultipleEndpoints(t *testing.T) {
 func TestErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	err := createTopicAndSub(ctx, "epub", "esub")
-	if err != nil {
-		t.Fatal(err)
-		return
-	}
+	createTopicAndSub(ctx, "epub", "", "")
 
 	errChan := make(chan error)
 	tr := makeTransport(ctx, errChan).Endpoint("esub", func(_ context.Context, req interface{}) (interface{}, error) { return nil, errors.New("foo") }, Decoder(decode))
@@ -189,10 +164,8 @@ func TestErrors(t *testing.T) {
 	}()
 
 	{
-		err := send(ctx, "epub", tr, []byte(`{"foo":"bar"}`))
-		if err != nil {
-			t.Fatalf("send to pubsub : %s", err)
-		}
+		send(ctx, tr, "epub", 0, false, `{"foo":"bar"}`)
+
 		select {
 		case <-ctx.Done():
 			t.Fatal("nothing received before timeout")
@@ -203,10 +176,7 @@ func TestErrors(t *testing.T) {
 		}
 	}
 	{
-		err := send(ctx, "epub", tr, []byte(`{"foo":1}`))
-		if err != nil {
-			t.Fatalf("send to pubsub : %s", err)
-		}
+		send(ctx, tr, "epub", 0, false, `{"foo":1}`)
 		select {
 		case <-ctx.Done():
 			t.Fatal("nothing received before timeout")
@@ -221,14 +191,11 @@ func TestErrors(t *testing.T) {
 // to launch before : gcloud beta emulators pubsub start
 func TestShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	err := createTopicAndSub(ctx, "xpub", "xsub")
-	if err != nil {
-		t.Fatal(err)
-		return
-	}
+	createTopicAndSub(ctx, "xpubsub", "", "")
+
 	shutdownCalled := false
 	exitChan := make(chan error)
-	tr := NewTransport(ctx, project).Endpoint("xsub", func(_ context.Context, req interface{}) (interface{}, error) { return nil, nil })
+	tr := NewTransport(ctx, url).Endpoint("xpubsub", func(_ context.Context, req interface{}) (interface{}, error) { return nil, nil })
 	go func() {
 		srv := kitty.NewServer(tr).Shutdown(func() {
 			shutdownCalled = true
@@ -252,9 +219,9 @@ type testStruct struct {
 	Foo string `json:"foo"`
 }
 
-func decode(ctx context.Context, m *pubsub.Message) (interface{}, error) {
+func decode(clt MQTT.Client, m MQTT.Message) (interface{}, error) {
 	d := &testStruct{}
-	err := json.Unmarshal(m.Data, d)
+	err := json.Unmarshal(m.Payload(), d)
 	if err != nil {
 		return nil, fmt.Errorf("decode error: %v", err)
 	}
@@ -262,8 +229,8 @@ func decode(ctx context.Context, m *pubsub.Message) (interface{}, error) {
 }
 
 // send sends a message to Pub/Sub topic. The topic must already exist.
-func send(ctx context.Context, topic string, tr *Transport, data []byte) error {
-	for tr.c == nil {
+func send(ctx context.Context, tr *Transport, topic string, qos byte, retained bool, payload interface{}) error {
+	for tr.clt == nil {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -271,23 +238,20 @@ func send(ctx context.Context, topic string, tr *Transport, data []byte) error {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	res := tr.c.Topic(topic).Publish(ctx, &pubsub.Message{Data: data})
-	_, err := res.Get(ctx)
-	return err
+	token := tr.clt.Publish(topic, qos, retained, payload)
+	return token.Error()
 }
 
-func createTopicAndSub(ctx context.Context, topicName, subscriptionName string) error {
-	c, err := pubsub.NewClient(ctx, project)
-	if err != nil {
-		return err
-	}
-	topic, err := c.CreateTopic(ctx, topicName)
-	if err == nil {
-		_, err = c.CreateSubscription(ctx, subscriptionName, pubsub.SubscriptionConfig{Topic: topic})
-	}
-	if err != nil {
-		return err
-	}
-	err = c.Close()
-	return err
+func createTopicAndSub(ctx context.Context, clientID, username, password string) {
+	connOpts := MQTT.NewClientOptions().
+		AddBroker(url).
+		SetClientID(clientID).
+		SetCleanSession(false).
+		SetUsername(username).
+		SetPassword(password).
+		SetAutoReconnect(true).
+		SetOrderMatters(false) // if we set that to true, we're loosing concurrency
+
+	c := MQTT.NewClient(connOpts)
+	c.Disconnect(0)
 }

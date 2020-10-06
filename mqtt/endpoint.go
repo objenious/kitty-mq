@@ -1,7 +1,7 @@
 package mqtt
 
 import (
-	"context"
+	"time"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"github.com/go-kit/kit/endpoint"
@@ -11,12 +11,14 @@ import (
 type EndpointOption func(*Endpoint)
 
 // DecodeRequestFunc is a function to decode pub/sub message and return structured data
-type DecodeRequestFunc func(context.Context, MQTT.Message) (interface{}, error)
+type DecodeRequestFunc func(MQTT.Client, MQTT.Message) (interface{}, error)
 
 // Endpoint for this pubsub transport
 type Endpoint struct {
 	// argument
-	topic string
+	topic   string
+	qos     byte
+	timeout time.Duration
 	// options
 	decode DecodeRequestFunc
 	// runtime

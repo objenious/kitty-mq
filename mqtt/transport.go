@@ -2,9 +2,9 @@ package mqtt
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"time"
 
-	"cloud.google.com/go/pubsub"
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"github.com/go-kit/kit/endpoint"
 	"github.com/objenious/kitty"
@@ -78,37 +78,37 @@ func (t *Transport) Start(ctx context.Context) error {
 }
 
 func (t *Transport) consume(ctx context.Context, e *Endpoint) error {
-	e.subscription = t.c.Subscription(e.subscriptionName)
-	exists, err := e.subscription.Exists(ctx)
+	token := t.clt.Subscribe(e.topic, e.qos, t.makeReceiveFunc(e))
+	err := token.Error()
 	if err != nil {
 		return err
-	} else if !exists {
-		return fmt.Errorf("The subscription %s does not exists", e.subscriptionName)
 	}
-	if e.maxExtension > 0 {
-		e.subscription.ReceiveSettings.MaxExtension = e.maxExtension
+	if e.timeout > time.Second {
+		b := token.WaitTimeout(e.timeout)
+		if !b {
+			return errors.New("wait timeout returns false")
+		}
+	} else {
+		b := token.Wait()
+		if !b {
+			return errors.New("wait timeout returns false")
+		}
 	}
-	if e.maxOutstandingMessages > 0 {
-		e.subscription.ReceiveSettings.MaxOutstandingMessages = e.maxOutstandingMessages
-	}
-	e.subscription.ReceiveSettings.Synchronous = e.synchronous
-	if e.numGoRoutines > 0 {
-		e.subscription.ReceiveSettings.NumGoroutines = e.numGoRoutines
-	}
-	return e.subscription.Receive(ctx, t.makeReceiveFunc(e))
+	return nil
 }
 
-func (t *Transport) makeReceiveFunc(e *Endpoint) func(ctx context.Context, msg *pubsub.Message) {
-	handler := func(ctx context.Context, msg *pubsub.Message) error {
-		PopulateRequestContext(ctx, msg)
+func (t *Transport) makeReceiveFunc(e *Endpoint) MQTT.MessageHandler {
+	handler := func(clt MQTT.Client, msg MQTT.Message) error {
+		ctx := context.Background()
+		PopulateRequestContext(ctx, clt, msg)
 		var (
 			dec interface{}
 			err error
 		)
 		if e.decode != nil {
-			dec, err = e.decode(ctx, msg)
+			dec, err = e.decode(clt, msg)
 		} else {
-			dec = msg.Data
+			dec = msg.Payload()
 		}
 		if err == nil {
 			_, err = e.endpoint(ctx, dec)
@@ -116,15 +116,15 @@ func (t *Transport) makeReceiveFunc(e *Endpoint) func(ctx context.Context, msg *
 		return err
 	}
 	handler = t.middleware(handler)
-	return func(ctx context.Context, msg *pubsub.Message) {
+	return func(clt MQTT.Client, msg MQTT.Message) {
 		defer func() {
 			if r := recover(); r != nil {
-				msg.Nack()
+				msg.Duplicate()
 			}
 		}()
-		err := handler(ctx, msg)
+		err := handler(clt, msg)
 		if kitty.IsRetryable(err) {
-			msg.Nack()
+			msg.Duplicate()
 		} else {
 			msg.Ack()
 		}
@@ -159,9 +159,9 @@ func (*Transport) LogKeys() map[string]interface{} {
 // PopulateRequestContext is a RequestFunc that populates several values into
 // the context from the pub/sub message. Those values may be extracted using the
 // corresponding ContextKey type in this package.
-func PopulateRequestContext(ctx context.Context, msg *pubsub.Message) context.Context {
-	for k, v := range map[contextKey]string{
-		contextKeyID: msg.ID,
+func PopulateRequestContext(ctx context.Context, clt MQTT.Client, msg MQTT.Message) context.Context {
+	for k, v := range map[contextKey]uint16{
+		contextKeyID: msg.MessageID(),
 	} {
 		ctx = context.WithValue(ctx, k, v)
 	}
